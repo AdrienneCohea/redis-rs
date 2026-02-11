@@ -33,8 +33,9 @@ AwsIamCredentialsProvider
 │   ├── region: String                     (AWS region)
 │   ├── service_name: AwsRedisServiceName  (elasticache | memorydb)
 │   ├── is_serverless: bool                (adds ResourceType=ServerlessCache param)
-│   ├── subscribers: Arc<Mutex<Vec<Sender>>>
-│   └── refresh_task_handle: Option<JoinHandle>
+│   ├── subscribers: Arc<Mutex<Vec<Sender>>>          (SharedSubscriptions type alias)
+│   ├── current_credentials: Arc<RwLock<Option<BasicAuth>>>  (for immediate yield to new subscribers)
+│   └── background_handle: Arc<Mutex<Option<JoinHandle>>>    (Arc+Mutex needed for start/stop/Drop)
 │
 ├── Constructors:
 │   ├── new(user_id, host_name, region, service_name, credentials_provider)
@@ -47,13 +48,24 @@ AwsIamCredentialsProvider
 │         → Build URL, SigV4 presign, strip http://
 │
 ├── Background Refresh:
-│   └── start(token_refresh_config) → spawns tokio task
-│         → Generates token every ~12-13 minutes (before 15m expiry)
+│   └── start(retry_config: RetryConfig) → spawns tokio task
+│         → Generates token every ~12 minutes (fixed interval, 80% of 15m lifetime)
+│         → Stores BasicAuth in current_credentials for new subscribers
 │         → Pushes BasicAuth { username: user_id, password: token } to subscribers
-│         → Retry with exponential backoff on failure
+│         → Retry with exponential backoff on failure (backon ExponentialBuilder)
+│         → Stops and notifies subscribers with error after max retries exhausted
 │
-└── impl StreamingCredentialsProvider:
-    └── subscribe() → returns Stream<Item = RedisResult<BasicAuth>>
+├── impl StreamingCredentialsProvider:
+│   └── subscribe() → returns Stream<Item = RedisResult<BasicAuth>>
+│         → Creates mpsc channel, adds sender to subscribers list
+│         → If current_credentials is Some, yields it immediately via stream::once
+│         → Chains with unfold stream for future updates (mirrors EntraId pattern)
+│
+├── impl Drop:
+│   └── drop() → calls stop() to abort the background task (prevents leaked tasks)
+│
+└── impl Debug:
+    └── fmt() → debug_struct with fields, redacting credential_provider
 ```
 
 #### New Feature Flag
@@ -65,6 +77,7 @@ aws-sigv4 = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
 aws-smithy-runtime-api = { version = "1", optional = true }
+http = { version = "1", optional = true }  # needed for constructing HTTP request for SigV4 signing
 
 [features]
 aws-iam = [
@@ -72,14 +85,29 @@ aws-iam = [
     "dep:aws-credential-types",
     "dep:aws-config",
     "dep:aws-smithy-runtime-api",
+    "dep:http",
     "token-based-authentication",  # reuse existing infra
     "tokio-comp"
 ]
 ```
 
+> **Note:** The `http` crate is required because `aws-sigv4`'s signing API operates on
+> `http::Request` types. Verify exact version compatibility with the `aws-sigv4` version chosen.
+
 #### Changes to Existing Files
 
-- **`redis/src/lib.rs`** — Add `#[cfg(feature = "aws-iam")] pub mod aws_iam;` and re-export public types
+- **`redis/src/lib.rs`** — Two additions, mirroring the `entra-id` pattern:
+  1. Module declaration:
+     ```rust
+     #[cfg(feature = "aws-iam")]
+     #[cfg_attr(docsrs, doc(cfg(feature = "aws-iam")))]
+     pub mod aws_iam;
+     ```
+  2. Re-exports (alongside the existing `entra-id` re-exports):
+     ```rust
+     #[cfg(feature = "aws-iam")]
+     pub use crate::aws_iam::{AwsIamCredentialsProvider, AwsRedisServiceName};
+     ```
 - **No changes needed** to `auth.rs`, `auth_management.rs`, `client.rs`, `connection.rs`, or `multiplexed_connection.rs` — the existing `StreamingCredentialsProvider` trait + `open_with_credentials_provider` works as-is
 
 #### Token Generation (Core Logic)
@@ -118,9 +146,16 @@ fn generate_auth_token(&self) -> RedisResult<String> {
 | Parameter | Recommended Value |
 |---|---|
 | Token validity | 15 minutes (AWS maximum) |
-| Refresh interval | ~12 minutes (refresh at 80% of token lifetime, reusing `TokenRefreshConfig`) |
+| Refresh interval | ~12 minutes (fixed, 80% of 15m lifetime) |
 | Connection re-auth | Before 12-hour window expires |
-| Retry config | Reuse existing `RetryConfig` (exponential backoff) |
+| Retry config | Reuse existing `RetryConfig` (exponential backoff via `backon::ExponentialBuilder`) |
+
+**Approach:** Use a fixed refresh interval of ~12 minutes (720 seconds). Unlike EntraId which
+subtracts a hardcoded `TOKEN_REFRESH_BUFFER_SECS` (240s) from the actual token expiry returned by
+Azure, AWS IAM tokens always have a fixed 15-minute lifetime. The `start()` method takes
+`RetryConfig` directly (matching `EntraIdCredentialsProvider::start(&mut self, retry_config: RetryConfig)`).
+The `TokenRefreshConfig` type exists in `auth_management.rs` but is currently unused by EntraId —
+we follow the same pattern and use `RetryConfig` directly for now.
 
 ### Usage Would Look Like
 
@@ -144,6 +179,40 @@ let client = Client::open_with_credentials_provider(
 
 let mut con = client.get_multiplexed_async_connection().await?;
 ```
+
+### Testing Strategy
+
+Following the established patterns from `entra_id.rs` and `tests/test_auth.rs`:
+
+#### Unit Tests (in `redis/src/aws_iam.rs`)
+
+- **Mock `CredentialsProvider`**: Create a `MockAwsCredentialsProvider` implementing the AWS
+  `ProvideCredentials` trait, similar to EntraId's `MockTokenCredential`. Support scenarios:
+  - `success()` — always returns valid `Credentials`
+  - `failure()` — always returns a credential error
+  - `alternating_fail_success()` — fails then succeeds (tests retry behavior)
+  - `multiple_tokens()` — returns different credentials over time
+- **Test cases** (mirroring EntraId's test suite):
+  - Provider creation without panicking
+  - Successful token generation (verify URL format, `http://` prefix stripped)
+  - `subscribe()` yields current credentials immediately when available
+  - Multiple concurrent subscribers all receive updates
+  - Token refresh over time with mock credentials
+  - Subscriber cleanup on stream close (channels retained/cleaned correctly)
+  - Error propagation after max retries exhausted
+  - Provider cleanup on drop (background task aborted)
+  - Serverless mode adds `ResourceType=ServerlessCache` to URL
+
+#### Integration Tests (in `redis/tests/test_aws_iam_auth.rs`)
+
+- Gated behind `#[cfg(feature = "aws-iam")]` and `#[ignore]` (require real AWS resources)
+- Environment variable driven:
+  - `REDIS_URL` — ElastiCache/MemoryDB endpoint
+  - `AWS_REGION` — AWS region
+  - `AWS_IAM_USER_ID` — ElastiCache/MemoryDB user ID
+  - `AWS_IAM_SERVICE_NAME` — `elasticache` or `memorydb`
+  - Standard AWS credential env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, etc.)
+- Test actual SET/GET operations to verify auth works end-to-end
 
 ### Summary of Advantages
 
