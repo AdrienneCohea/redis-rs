@@ -666,6 +666,8 @@ pub use {
         DeveloperToolsCredentialOptions, ManagedIdentityCredentialOptions, UserAssignedId,
     },
 };
+#[cfg(feature = "aws-iam")]
+pub use crate::aws_iam::{AwsIamCredentialsProvider, AwsRedisServiceName};
 
 // preserve grouping and order
 #[rustfmt::skip]
@@ -793,6 +795,10 @@ pub mod caching;
 #[cfg(feature = "entra-id")]
 #[cfg_attr(docsrs, doc(cfg(feature = "entra-id")))]
 pub mod entra_id;
+
+#[cfg(feature = "aws-iam")]
+#[cfg_attr(docsrs, doc(cfg(feature = "aws-iam")))]
+pub mod aws_iam;
 
 #[cfg(feature = "token-based-authentication")]
 #[cfg_attr(docsrs, doc(cfg(feature = "token-based-authentication")))]

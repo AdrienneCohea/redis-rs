@@ -120,6 +120,12 @@ azure_identity = { version = "0.31", optional = true, features = [
 azure_core = { version = "0.31", optional = true }
 base64 = { version = "0.22.1", optional = true }
 
+# Only needed for AWS IAM authentication
+aws-sigv4 = { version = "1", optional = true }
+aws-credential-types = { version = "1", optional = true }
+aws-config = { version = "1", optional = true }
+aws-smithy-runtime-api = { version = "1", optional = true, features = ["client"] }
+
 [features]
 default = ["acl", "streams", "geospatial", "script", "num-bigint"]
 acl = []
@@ -156,6 +162,14 @@ entra-id = [
   "dep:azure_identity",
   "dep:azure_core",
   "dep:base64",
+  "token-based-authentication",
+  "tokio-comp",
+]
+aws-iam = [
+  "dep:aws-sigv4",
+  "dep:aws-credential-types",
+  "dep:aws-config",
+  "dep:aws-smithy-runtime-api",
   "token-based-authentication",
   "tokio-comp",
 ]
