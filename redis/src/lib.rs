@@ -633,6 +633,8 @@ let primary = sentinel.get_async_connection().await.unwrap();
 )]
 
 // public api
+#[cfg(feature = "aws-iam")]
+pub use crate::aws_iam::{AwsIamCredentialsProvider, AwsRedisServiceName};
 #[cfg(feature = "aio")]
 pub use crate::client::AsyncConnectionConfig;
 pub use crate::client::Client;
@@ -666,8 +668,6 @@ pub use {
         DeveloperToolsCredentialOptions, ManagedIdentityCredentialOptions, UserAssignedId,
     },
 };
-#[cfg(feature = "aws-iam")]
-pub use crate::aws_iam::{AwsIamCredentialsProvider, AwsRedisServiceName};
 
 // preserve grouping and order
 #[rustfmt::skip]

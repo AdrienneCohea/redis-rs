@@ -154,7 +154,13 @@ impl AwsIamCredentialsProvider {
             .expect("AWS credentials provider not found in default config")
             .clone();
 
-        Self::new(user_id, host_name, region, service_name, credentials_provider)
+        Self::new(
+            user_id,
+            host_name,
+            region,
+            service_name,
+            credentials_provider,
+        )
     }
 
     /// Set whether this is a serverless cache (adds `ResourceType=ServerlessCache` to the URL).
@@ -185,10 +191,7 @@ impl AwsIamCredentialsProvider {
 
         let identity: Identity = credentials.into();
 
-        let mut url = format!(
-            "http://{}/?Action=connect&User={}",
-            host_name, user_id
-        );
+        let mut url = format!("http://{}/?Action=connect&User={}", host_name, user_id);
         if is_serverless {
             url.push_str("&ResourceType=ServerlessCache");
         }
@@ -213,15 +216,19 @@ impl AwsIamCredentialsProvider {
             })?
             .into();
 
-        let signable_request =
-            SignableRequest::new("GET", &url, std::iter::empty(), SignableBody::UnsignedPayload)
-                .map_err(|err| {
-                    RedisError::from((
-                        ErrorKind::AuthenticationFailed,
-                        "Failed to create signable request",
-                        format!("{err}"),
-                    ))
-                })?;
+        let signable_request = SignableRequest::new(
+            "GET",
+            &url,
+            std::iter::empty(),
+            SignableBody::UnsignedPayload,
+        )
+        .map_err(|err| {
+            RedisError::from((
+                ErrorKind::AuthenticationFailed,
+                "Failed to create signable request",
+                format!("{err}"),
+            ))
+        })?;
 
         let output = sign(signable_request, &signing_params).map_err(|err| {
             RedisError::from((
@@ -243,10 +250,7 @@ impl AwsIamCredentialsProvider {
         }
 
         // Strip http:// prefix as required by the Redis AUTH command
-        let token = url
-            .strip_prefix("http://")
-            .unwrap_or(&url)
-            .to_string();
+        let token = url.strip_prefix("http://").unwrap_or(&url).to_string();
 
         Ok(token)
     }
@@ -406,9 +410,9 @@ impl Drop for AwsIamCredentialsProvider {
 #[cfg(all(feature = "aws-iam", test))]
 mod tests {
     use super::*;
-    use aws_credential_types::provider::future::ProvideCredentials as ProvideCredentialsFuture;
-    use aws_credential_types::provider::ProvideCredentials;
     use aws_credential_types::Credentials;
+    use aws_credential_types::provider::ProvideCredentials;
+    use aws_credential_types::provider::future::ProvideCredentials as ProvideCredentialsFuture;
     use futures_util::StreamExt;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -431,7 +435,13 @@ mod tests {
     #[derive(Debug)]
     struct MockAwsCredentialsProvider {
         call_count: Arc<AtomicUsize>,
-        responses: Arc<TokioMutex<VecDeque<Result<Credentials, aws_credential_types::provider::error::CredentialsError>>>>,
+        responses: Arc<
+            TokioMutex<
+                VecDeque<
+                    Result<Credentials, aws_credential_types::provider::error::CredentialsError>,
+                >,
+            >,
+        >,
     }
 
     impl MockAwsCredentialsProvider {
@@ -647,10 +657,12 @@ mod tests {
         if let Some(result) = stream.next().await {
             assert!(call_count.load(Ordering::SeqCst) > 0);
             assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("authentication failed"));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("authentication failed")
+            );
         }
     }
 
@@ -770,5 +782,39 @@ mod tests {
         .unwrap();
 
         assert!(token.contains("test-cluster.abc123.memorydb.us-east-1.amazonaws.com"));
+    }
+
+    #[tokio::test]
+    async fn test_actual_memory_db() -> RedisResult<()> {
+        use crate::Client;
+        // Create the credentials provider using default AWS credential chain
+        let mut provider = AwsIamCredentialsProvider::new_from_env(
+            "iam-auth-demo".to_string(),
+            "clustercfg.enchantress.lhgpto.memorydb.us-east-1.amazonaws.com:6379".to_string(),
+            "us-east-1".to_string(),
+            AwsRedisServiceName::MemoryDB,
+        )
+        .await;
+        provider.start(RetryConfig::default());
+
+        // Create Redis client with credentials provider
+        let client = Client::open_with_credentials_provider(
+            "rediss://clustercfg.enchantress.lhgpto.memorydb.us-east-1.amazonaws.com:6379",
+            provider,
+        )
+        .expect("open with credentials provider");
+
+        let mut con = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("getting multiplexed connection");
+        crate::cmd("SET")
+            .arg("my_key")
+            .arg(42i32)
+            .exec_async(&mut con)
+            .await
+            .expect("exec");
+
+        Ok(())
     }
 }
